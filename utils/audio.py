@@ -1,212 +1,160 @@
-# 기본 
-import os
-import threading
+import math
 import time
-import wave
+import threading
+import queue
+from collections import deque
+from typing import Callable, Optional
 
-# 추가
 import numpy as np
-from faster_whisper import WhisperModel
-import speech_recognition as sr
-import noisereduce as nr
-import webrtcvad
+import sounddevice as sd
+import torch
+
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 512  # Silero VAD requires exactly 512 samples at 16kHz
 
 
-class Audio_record:
-    def __init__(self):
-        '''
-        요청 받았을 때 오디오를 스트리밍 하여 원하는 만큼 녹음하여 디노이즈
-        '''
-        # 기본 선언
-        self.sample_rate = 16000
-        self.chunk_duration_ms = 30 # 청크의 길이를 ms단위로 지정(VAD 로직에서 필요)
-        self.vad_sec = 1 # n초 이상 말이 없을 경우 녹음 중지
-        self.chunk_size = int(self.sample_rate * self.chunk_duration_ms / 1000) # 청크 크기를 샘플 단위로 계산
-        self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone(sample_rate=self.sample_rate, chunk_size=self.chunk_size)
-        self.buffer = []
-        self.recording = False
+class AudioCapture:
+    """
+    Captures microphone audio via sounddevice, runs Silero VAD per-chunk, and emits
+    complete speech segments to segment_queue as dicts:
 
-        # VAD 초기화
-        self.vad = webrtcvad.Vad(1) # 민감도 설정(0~3, 3이 제일 민감함)
-        
-        # 주변 소음 조정
-        self.adjust_noise()
+        {"audio": np.float32[], "ts_start": float, "ts_end": float, "forced_lang": str|None}
 
-        print('Audio_record 초기화 성공')
-        
-    def adjust_noise(self):
-        '''
-        주변 소음 조정
-        '''
-        with self.microphone as source:
-            print('주변 소음에 맞게 조정 중...')
-            self.recognizer.adjust_for_ambient_noise(source)
-            self.recognizer.energy_threshold += 100
+    Audio stays in memory the entire time — nothing is written to disk (see PRD.md:
+    the v1 disk round-trip was the original race-condition bug). Timestamps are
+    wall-clock so downstream consumers (and the future agent layer) can order and
+    correlate utterances.
 
-    def record_start(self):
-        '''녹음이 시작되는 함수'''
-        if self.recording == False:
-            self.record_thread = threading.Thread(target=self._record_start)
-            self.record_thread.start()
-    
-    def _record_start(self):
-        '''VAD 감지 조건으로 녹음이 게속되는 내부 함수'''
-        self.recording = True
-        self.buffer = []
-        no_voice_target_cnt = (self.vad_sec*1000) # 녹음 목표 초를 ms로 변환
-        no_voice_cnt = 0 # 위 변수와 비교할 cnt 설정
-        with self.microphone as source:
-            while self.recording:
-                chunk = source.stream.read(self.chunk_size)
-                self.buffer.append(chunk)
-                if self._vad(chunk, self.sample_rate):
-                    no_voice_cnt = 0
-                else:
-                    no_voice_cnt += self.chunk_duration_ms
-                # vad가 일정 시간 감지 안되면 녹음 중지
-                if no_voice_cnt >= no_voice_target_cnt:
-                    self.recording = False
+    Two refinements over the naive VAD loop (see PRD.md "Behavior", "Language selection"):
 
-    def _vad(self, chunk, sample_rate):
-        '''주어진 청크가 음성인지 여부를 반환하는 함수'''
-        # 청크가 int16 형식인지 확인
-        if isinstance(chunk, bytes):
-            chunk = np.frombuffer(chunk, dtype=np.int16)
-        # 청크가 10ms, 20ms, 30ms 길이인지 확인
-        if len(chunk) != self.chunk_size:
-            raise ValueError("Chunk size must be exactly 10ms, 20ms, or 30ms")
-        return self.vad.is_speech(chunk.tobytes(), sample_rate)
-        
-    def record_stop(self, denoise_value):
-        '''녹음이 종료되고 디노이징 과정을 거치는 함수'''
-        # thread 종료하고, 끝날 때 까지 join으로 대기
-        self.recording = False
-        self.record_thread.join()
-        # 버퍼를 하나의 오디오 데이터로 결합
-        audio_data = np.frombuffer(b''.join(self.buffer), dtype=np.int16)
-        sample_rate = self.microphone.SAMPLE_RATE
-        return self._denoise_process(audio_data, sample_rate, denoise_value)
+    * **Pre-roll** — a small rolling buffer of pre-onset chunks is prepended to each
+      segment so VAD's detection latency doesn't clip the first phoneme.
+    * **forced_lang latch** — the decode language is read from ``get_forced_lang`` once,
+      at speech onset, and frozen onto the segment. It is never re-read at transcribe
+      time, so an async ASR backlog can't race a hold key the user has since released.
+    * **max-segment flush** — a speaker who never pauses is force-flushed at
+      ``max_segment_s`` (kept under Whisper's 30s window) so latency and memory stay bounded.
+    """
 
-    
-    def load_wav(self, path, denoise_value):
-        '''wav파일을 불러와 디노이징 과정을 거치는 함수'''
-        buffer = []
-        with wave.open(path, 'rb') as wf:
-            chunk_size = self.chunk_size
-            data = wf.readframes(chunk_size)
-            while data:
-                buffer.append(data)
-                data = wf.readframes(chunk_size)
+    def __init__(
+        self,
+        segment_queue: queue.Queue,
+        vad_model,
+        silence_ms: int = 800,
+        threshold: float = 0.5,
+        get_forced_lang: Optional[Callable[[], Optional[str]]] = None,
+        preroll_ms: int = 200,
+        max_segment_s: float = 25.0,
+    ):
+        self.segment_queue = segment_queue
+        self.vad_model = vad_model
+        self.silence_ms = silence_ms
+        self.threshold = threshold
+        self._get_forced_lang = get_forced_lang
 
-        audio_data = np.frombuffer(b''.join(buffer), dtype=np.int16)
-        sample_rate = wf.getframerate()
-        return self._denoise_process(audio_data, sample_rate, denoise_value)
+        self._preroll_chunks = max(1, math.ceil(preroll_ms / 1000 * SAMPLE_RATE / CHUNK_SIZE))
+        self._max_samples = int(max_segment_s * SAMPLE_RATE)
 
-    
-    def _denoise_process(self, audio_data, sample_rate, denoise_value):
-        '''
-        오디오를 받아 디노이징을 적용하고, 원본과 디노이즈값둘 둘 다 저장하고 반환한다.
-        
-        audio_data : int16 np 형식 오디오 데이터. chunk를 append하여 만들어진 buffer를 다음과 같이 처리한 예시) np.frombuffer(b''.join(self.buffer), dtype=np.int16)
-        sample_rate : 샘플 레이트 입력
-        denoise_value : 디노이즈 적용값 설정
-        
-        return: {'audio_denoise': audio_denoise, 'audio_noise': audio_noise, 'sample_rate': sample_rate}
-        '''
-        # 1. 노이즈 감소 처리
-        denoise = nr.reduce_noise(y=audio_data, sr=sample_rate, prop_decrease=denoise_value)
-        buffer_denoise = [denoise.tobytes()] # 데이터를 다시 버퍼로 변환
-        # 2. 노이즈 감소 없이
-        noise = nr.reduce_noise(y=audio_data, sr=sample_rate, prop_decrease=0.0)
-        buffer_noise = [noise.tobytes()] # 데이터를 다시 버퍼로 변환
-        
-        # 1. 노이즈 감소 파일 저장
-        self._save_buffer_to_wav(buffer_denoise, self.microphone.SAMPLE_RATE, self.microphone.SAMPLE_WIDTH, 'input_denoise.wav')
-        # 2. 노이즈 감소 없는 파일 저장
-        self._save_buffer_to_wav(buffer_noise, self.microphone.SAMPLE_RATE, self.microphone.SAMPLE_WIDTH, 'input_noise.wav')
-        
-        # 오디오 소스 파일로 return
-        audio_denoise = self._buffer_to_numpy(buffer_denoise, self.microphone.SAMPLE_RATE)
-        audio_noise = self._buffer_to_numpy(buffer_noise, self.microphone.SAMPLE_RATE)
+        self._frame_deque: deque = deque()
+        self._running = False
+        self._stream = None
+        self._vad_thread = None
 
-        return {'audio_denoise':audio_denoise, 'audio_noise':audio_noise, 'sample_rate':self.microphone.SAMPLE_RATE}
+    def start(self):
+        self._running = True
+        self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
+        self._vad_thread.start()
+        self._stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=CHUNK_SIZE,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
 
+    def stop(self):
+        self._running = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
-    def _buffer_to_numpy(self, buffer, sample_rate):
-        '''buffer를 입력하면 whisper에서 추론 가능한 입력 형태의 오디오로 반환'''
-        audio_data = np.frombuffer(b''.join(buffer), dtype=np.int16)
-        audio_data = audio_data.astype(np.float32) / 32768.0  # Convert to float32        
-        return audio_data
-        
+    def _audio_callback(self, indata, frames, time_info, status):
+        # Runs in a C thread — only append, no heavy work
+        self._frame_deque.append(indata[:, 0].copy())
 
-    def _save_buffer_to_wav(self, buffer, sample_rate, sample_width, filename):
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(1)  # 모노
-            wf.setsampwidth(sample_width)
-            wf.setframerate(sample_rate)
-            wf.writeframes(b''.join(buffer))
+    def _latch_forced_lang(self) -> Optional[str]:
+        """Read the hold-key state once, at onset. Never raises into the loop."""
+        if self._get_forced_lang is None:
+            return None
+        try:
+            return self._get_forced_lang()
+        except Exception:
+            return None
 
+    def _flush(self, buffer: list, ts_start: float, forced_lang: Optional[str]):
+        if not buffer:
+            return
+        self.segment_queue.put({
+            "audio": np.concatenate(buffer),
+            "ts_start": ts_start,
+            "ts_end": time.time(),
+            "forced_lang": forced_lang,
+        })
 
-class Cumtom_faster_whisper:
-    def __init__(self):
-        '''
-        최대 4배 빠른 faster whisper를 사용하여 cpu로 저장된 wav파일에 STT 수행
-        '''
-        # 환경 설정(Window 아나콘다 환경에서 아래 코드 실행 안하면 에러남)
-        try: os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "true"
-        except Exception as e: print(f'os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "true" 실행해서 발생한 에러. 하지만 무시하고 진행: {e}')
+    def _vad_loop(self):
+        from silero_vad import VADIterator
 
-        try: os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-        except Exception as e: print(f'os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" 실행해서 발생한 에러. 하지만 무시하고 진행: {e}')
-        print('Cumtom_faster_whisper 초기화 성공')
+        vad_iter = VADIterator(
+            self.vad_model,
+            sampling_rate=SAMPLE_RATE,
+            threshold=self.threshold,
+            min_silence_duration_ms=self.silence_ms,
+        )
 
-    def set_model(self, model_name):
-        '''
-        모델 설정
-        '''
-        model_list = ['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1', 'large-v2', 'large-v3', 'large']
-        if not model_name in model_list:
-            model_name = 'base'
-            print('모델 이름 잘못됨. base로 설정. 아래 모델 중 한가지 선택')
-            print(model_list)
-        self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
-        return model_name
+        preroll: deque = deque(maxlen=self._preroll_chunks)
+        speech_buffer: list = []
+        seg_samples = 0
+        in_speech = False
+        seg_start = 0.0
+        forced_lang: Optional[str] = None
 
-    def run(self, audio, language=None):
-        '''
-        저장된 tmp.wav를 불러와서 STT 추론 수행
+        while self._running:
+            if not self._frame_deque:
+                time.sleep(0.01)
+                continue
 
-        audio : wav파일의 경로 or numpy로 변환된 오디오 파일 소스
-        language : ko, en 등 언어 선택 가능. 선택하지 않으면 언어 분류 모델 내부적으로 수행함
-        '''
-        start = time.time()
-        # 추론
+            chunk = self._frame_deque.popleft()
+            if len(chunk) != CHUNK_SIZE:
+                continue
 
-        segments, info = self.model.transcribe(audio, beam_size=5, word_timestamps=True, language=language)
-        # 결과 후처리
-        dic_list = []
-        for segment in segments:
-            if segment.no_speech_prob > 0.6: continue # 말을 안했을 확률이 크다고 감지되면 무시
-            for word in segment.words:
-                _word = word.word
-                _start = round(word.start, 2)
-                _end = round(word.end, 2)
-                dic_list.append([_word, _start, _end])
-        # 시간 계산
-        self.spent_time = round(time.time()-start, 2)
-        
-        # 텍스트 추출
-        result_txt = self._make_txt(dic_list)
-        print(result_txt)
-        return dic_list, result_txt, self.spent_time
+            chunk_tensor = torch.from_numpy(chunk)
+            result = vad_iter(chunk_tensor, return_seconds=False)
 
-    def _make_txt(self, dic_list):
-        '''
-        [word, start, end]에서 word만 추출하여 txt로 반환
-        '''
-        result_txt = ''
-        for dic in dic_list:
-            txt = dic[0]
-            result_txt = f'{result_txt}{txt}'
-        return result_txt
+            if result:
+                if "start" in result:
+                    in_speech = True
+                    speech_buffer = list(preroll)  # pre-roll: chunks captured just before onset
+                    seg_samples = sum(len(c) for c in speech_buffer)
+                    seg_start = time.time() - seg_samples / SAMPLE_RATE
+                    forced_lang = self._latch_forced_lang()
+                elif "end" in result:
+                    in_speech = False
+                    self._flush(speech_buffer, seg_start, forced_lang)
+                    speech_buffer = []
+                    seg_samples = 0
+
+            if in_speech:
+                speech_buffer.append(chunk)
+                seg_samples += len(chunk)
+                if seg_samples >= self._max_samples:
+                    # Forced mid-utterance flush — speaker never paused. Keep capturing:
+                    # the next chunk starts a fresh segment with no pre-roll (no silence gap).
+                    self._flush(speech_buffer, seg_start, forced_lang)
+                    speech_buffer = []
+                    seg_samples = 0
+                    seg_start = time.time()
+                    forced_lang = self._latch_forced_lang()
+
+            preroll.append(chunk)

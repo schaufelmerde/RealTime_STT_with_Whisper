@@ -1,8 +1,11 @@
-# pip install -r requirements.txt
-
-pydub==0.25.1
-pyaudio==0.2.14
+sounddevice==0.4.6
+numpy>=1.26.0
 faster-whisper==1.0.2
-SpeechRecognition==3.10.4
-noisereduce==3.0.2
-webrtcvad==2.0.10
+torch>=2.1.0
+torchaudio>=2.1.0
+silero-vad
+pynput>=1.7.6  # OS-level hold-to-force-language hotkey (Streamlit can't see keyup)
+streamlit>=1.35.0
+# Cloud layer: transcript cleanup + KO<->EN translation (and the future agent layer)
+anthropic>=0.69.0
+python-dotenv>=1.0.0

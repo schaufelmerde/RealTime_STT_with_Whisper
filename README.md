@@ -1,109 +1,157 @@
 # RealTime_STT_with_Whisper
 
-OpenAI의 Whisper 모델과 VAD(Voice Activity Detector)를 사용해 구현한 실시간 STT 모델
+Real-time **Korean–English** assistant transcriber. Speech-to-text runs **on-device**
+(faster-whisper + Silero VAD, fully offline); a hybrid **cloud** layer adds translation
+and, later, agent delegation. The full design lives in [PRD.md](PRD.md) — this README is
+the short version.
 
-## 프로젝트 개요
-이 프로젝트는 OpenAI의 Whisper 모델을 사용하여 음성을 텍스트로 변환하는 실시간 STT(Speech-to-Text) 시스템을 구현한 것입니다. VAD(Voice Activity Detector)를 통해 자동으로 녹음을 중지하는 기능도 포함되어 있습니다.
+> This repo pivoted from an earlier on-device Korean **dictation** tool (v1–v5) to a
+> bilingual **conversation** transcriber. See [Project history](#project-history) for why.
 
-## 주요 기능
-- **녹음 시작**: 음성 활동 감지 모델을 통해 자동으로 녹음을 시작하고, 1초 동안 음성이 없으면 자동으로 녹음을 중지합니다.
-- **음성 로드**: 사전에 저장된 음성 파일을 로드하여 STT 기능을 수행할 수 있습니다.
-- **모델 적용**: 다양한 Whisper STT 모델을 적용할 수 있으며, 실시간에 유리한 tiny, base 모델을 추천합니다.
-- **STT 모델 추론**: 녹음되거나 로드된 음성을 STT하여 텍스트로 변환합니다.
-- **출력창 리셋**: 텍스트 출력 창을 초기화합니다.
-- **주변 소음 조절 초기화**: 주변의 마이크 소음을 조절하여 마이크를 최적화합니다.
-- **노이즈 감도 조절**: 0에서 1 사이로 디노이즈 감도를 조절할 수 있습니다.
+---
 
-## 기능 설명 및 데모 영상
-1. **STT GUI 구현 테스트 영상**
-  
-1-1. 음성 활동 감지(VAD)를 통한 자동 녹음 중지 기능 설명(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/WDDFrGd1XBg/0.jpg)](https://www.youtube.com/watch?v=WDDFrGd1XBg)  
-  
-1-2. 음성 로드 기능 설명(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/0IZx-0-FGZI/0.jpg)](https://www.youtube.com/watch?v=0IZx-0-FGZI)  
-  
-1-3. 모델 변경 기능 설명(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/sQlIkdLi9Bs/0.jpg)](https://www.youtube.com/watch?v=sQlIkdLi9Bs)  
-  
-1-4. 디노이즈 관련 기능 설명(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/N6eltE5N9MM/0.jpg)](https://www.youtube.com/watch?v=N6eltE5N9MM)  
-  
+## Status — Phase 1: local STT
 
+Delivery is staged so the first build is small and fully local. **Phase 1 = English +
+Korean speech-to-text only** — no LLM, no network, no API key.
 
+| Phase | Scope | Network | LLM |
+|-------|-------|---------|-----|
+| **P1 — Local STT (current)** | KO + EN mic transcription, utterance-final, on the bus | none (offline) | none |
+| P2 — Translation + cleanup | bidirectional KO↔EN translation + ASR cleanup | cloud | Claude Haiku |
+| P3 — Agents | task delegation over the transcript stream | cloud | Sonnet/Opus |
 
-2. **싱글보드 STT 구동 테스트 영상**
-  
-2-1.개발PC_Stt 온디바이스 데모(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/Kit1lvTWxxg/0.jpg)](https://www.youtube.com/watch?v=Kit1lvTWxxg)  
-  
-2-2. 라즈베리파이_Stt 온디바이스 데모(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/UtyPmrirj_0/0.jpg)](https://www.youtube.com/watch?v=UtyPmrirj_0)  
-  
-2-3. 젯슨오린나노_Stt 온디바이스 데모(이미지 클릭 시 영상으로 이동)  
-[![alt text](https://img.youtube.com/vi/MfX-K7kKF_Y/0.jpg)](https://www.youtube.com/watch?v=MfX-K7kKF_Y)  
+It is **utterance-final, not streaming**: a line appears after the speaker pauses (VAD
+detects end-of-speech), not word-by-word.
 
-  
-## 설치 및 실행 방법
-이 프로젝트를 로컬에서 실행하려면 아래 단계를 따르세요.
+---
 
-### 1. 환경 설정
-- Windows11 Anaconda python 3.10 환경 기준으로 설명합니다. 다른 환경에 설치할 경우 참고 바랍니다.
-- 먼저 다음 링크에서 "Microsoft Build Tools"를 설치하십시오: https://visualstudio.microsoft.com/ko/visual-cpp-build-tools/
-- "C++를 사용한 데스크톱 개발"만 설치하면 됩니다.
-- 이후 아나콘더 터미널을 열고 아래와 같이 설치를 진행합니다.
+## How it works
+
+```
+Microphone
+  ▼  sounddevice (callback stream, float32 @ 16kHz, in-memory only)
+[1] Silero VAD ─ detects speech start/end ─► segment {audio, ts_start, ts_end, forced_lang}
+  ▼
+[2] faster-whisper (int8, CPU) ─► TranscriptEvent {text, source_lang, lang_source}
+  ▼  (Phase 2: Translator enriches the event here — bypassed in P1)
+TranscriptBus  ─ thread-safe pub/sub ─►  [UI sink]   [Agent orchestrator (P3)]
+```
+
+Audio never touches disk — everything is passed as in-memory numpy. The **TranscriptBus**
+is the seam: the UI is one subscriber today; the future agent layer subscribes instead of
+forcing a rewrite. See [PRD.md](PRD.md) for the full architecture and rationale.
+
+---
+
+## Language selection — hold to force
+
+ASR is bound to an **explicit language pair** (default English + Korean) rather than
+open-ended detection, because Whisper's auto-detect is fragile on short clips. Each
+utterance's language is latched at speech onset:
+
+- **Key not held → constrained auto-detect** over the pair. The hands-free default — this
+  is what transcribes the *other party*, who never touches a key.
+- **Hold key → force the secondary language.** Deterministic; for when *you* code-switch
+  and want certainty. Forced lines are marked 🔒 in the transcript.
+
+The hold key is a global OS hotkey (**Right Ctrl** by default, configurable in the
+sidebar) because the browser/Streamlit UI can't reliably see key-up. If `pynput` isn't
+available, the app runs auto-detect-only and tells you so.
+
+---
+
+## Quickstart
+
+**Prerequisites (Windows 10/11):**
+- Python 3.10+ (3.12 used in development), CPU-only is fine.
+- [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  ("Desktop development with C++") for building some native wheels.
+
+**Install & run:**
 
 ```bash
-conda create -n whisper python=3.10
-y
-conda activate whisper
+python -m venv venv
+venv\Scripts\activate          # Windows (PowerShell: venv\Scripts\Activate.ps1)
 pip install -r requirements.txt
+
+streamlit run main.py          # NOT `python main.py` — it's a Streamlit app
 ```
 
-## 모듈 구동 방법
-```bash
-python main.py
-```
+In the UI: pick the model size and language pair in the sidebar, press **Start**, and
+speak. Hold **Right Ctrl** to force the secondary language. Phase 1 needs no API key.
 
-## 라이센스  
-아래 라이브러리들의 라이센스를 포함합니다.  
-pydub, pyaudio, faster-whisper, SpeechRecognition, noisereduce, webrtcvad  
-  
-## 블로그  
-https://blog.naver.com/112fkdldjs/223513947371  
-  
-    
-# 버전 히스토리
-## 240618_v1
-240618 실시간 STT 테스트
+---
 
-[문제점]
-- tmp.wav를 저장해서 불러오는 방식이라 그 과정에서 계속 알 수 없는 에러가 발생(읽는 타이밍이 꼬이는듯)
-- 마지막 단어를 배출하지 못하는 특성 있음. 그리고 10초가 지나면 잊혀짐
-- wav파일을 넣었을 때랑, tmp.wav를 실시간으로 불러왔을 때랑 추론 결과가 다른 것 같음. 전자가 성능이 더 좋은 것 같음
+## Configuration
 
-## 240619_v2
-GUI로 STT 테스트
-- faster_whisper로 cpu통해서 tiny, base 모델 테스트 가능하게 gui 구성
-- exe파일 생성
+Set in the sidebar (locked while recording):
 
-## 240619_v3 
-노이즈 제거 기능 테스트 중. (녹음 중지 버튼 삭제 필요. 대화가 끝낫다는 사실 인지 기능 추가 필요)
-- main.py기능은 안만짐
-- '잡음 제거 테스트.ipynb' 하나 만들어서 잡음 제거 기능 테스트 중임
-- 통합 GUI 모듈 제작함
-![alt text](README_img/img1.png)
+| Setting | Default | Notes |
+|---------|---------|-------|
+| Whisper model | `small` | `small` = best speed/accuracy on CPU; drop to `tiny`/`base` if latency is high |
+| Primary language | English | auto-detected (constrained to the pair) |
+| Secondary language | Korean | what the hold key forces |
+| Hold key | Right Ctrl | global OS hotkey |
+| Silence cutoff | 800 ms | silence that ends a speech segment |
+| VAD sensitivity | 0.5 | lower = picks up quieter speech |
 
-## 240705_v4
-'녹음 중지'버튼 제거 목적
-- 녹음 중지버튼이 제거되고 VAD를 통해 목소리를 감지하여 n초동안 음성이 없을 경우 자동으로 녹음을 종료함
-- webrtcvad 라이브러리는 사용하여 구현함
-- Audio_record Class의 _vad 함수에 상세 내용 있음
-- 녹음 시작 시 LED 상태창이 빨간불로 바뀌고, 녹음이 종료되면 회식으로 꺼짐
-![alt text](README_img/img2.png)
+**Phase 2 (translation):** copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`. The
+"Translate (Claude)" toggle then enables KO↔EN translation + cleanup. Without a key,
+transcription still works — translation just stays off.
 
-## 240715_v5
-- main과 utils 폴더 분리
-- 필요 없는 임시파일들 모두 정리
-- requirments.txt 완성(가상환경 새로 만들어서 제대로 동작하는지 테스트 완료)
-- README.md 완성
+---
+
+## Project layout
+
+| Path | Role |
+|------|------|
+| [main.py](main.py) | Streamlit UI + pipeline wiring (throwaway MVP host) |
+| [utils/audio.py](utils/audio.py) | mic capture, Silero VAD, segmentation (pre-roll, `forced_lang` latch, max-length flush) |
+| [utils/transcriber.py](utils/transcriber.py) | faster-whisper decode; per-segment forced lang / constrained auto-detect |
+| [utils/hotkey.py](utils/hotkey.py) | `LanguageController` — language pair + OS hold-key state |
+| [utils/events.py](utils/events.py) | `TranscriptEvent` schema + `TranscriptBus` (the consumer seam) |
+| [utils/translator.py](utils/translator.py) | Phase 2 — Claude cleanup + KO↔EN translation |
+| [PRD.md](PRD.md) | full product/design doc |
+
+---
+
+## Roadmap
+
+- **P1 (now)** — local KO/EN STT, offline, on the bus.
+- **P2** — bidirectional KO↔EN translation + ASR cleanup via Claude Haiku, enriching each
+  event without changing the schema or local pipeline.
+- **P3** — an agent orchestrator subscribes to the bus for task delegation.
+- **Later** — migrate the UI off Streamlit to FastAPI + WebSocket before the agent layer;
+  lightweight speaker attribution.
+
+---
+
+## Project history
+
+Versions **v1–v5** (Jun–Jul 2024) were a single-speaker, offline Korean **dictation** GUI
+with on-device demos (PC, Raspberry Pi, Jetson Orin Nano). Key lessons carried into v3 and
+baked into the current architecture:
+
+- v1 wrote `tmp.wav` and read it back across threads → constant file-locking races on
+  Windows. **Fix: never touch disk — pass numpy in-memory.**
+- "Real-time" had degraded into record → stop → batch-transcribe (push-to-talk with lag),
+  and a 10s sliding re-transcription window that lost context and couldn't keep up on CPU.
+- `webrtcvad` was frame-size/encoding sensitive and failed silently → replaced with Silero.
+
+v3 is a deliberate re-scope to a **bilingual conversation** transcriber with a cloud/agent
+seam — a different product, not an increment. See [PRD.md](PRD.md) for the full "why".
+
+---
+
+## Credits & license
+
+Built on: [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+[silero-vad](https://github.com/snakers4/silero-vad),
+[sounddevice](https://python-sounddevice.readthedocs.io/),
+[PyTorch](https://pytorch.org/), [Streamlit](https://streamlit.io/),
+[pynput](https://github.com/moses-palmer/pynput), and (Phase 2) the
+[Anthropic SDK](https://github.com/anthropics/anthropic-sdk-python). Their respective
+licenses apply.
+
+Author's blog (Korean): https://blog.naver.com/112fkdldjs/223513947371
