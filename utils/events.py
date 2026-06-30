@@ -20,7 +20,9 @@ class TranscriptEvent:
     Translator enriches it (``clean_text`` + ``translation`` + ``target_lang``). ``lang_source``
     records how the language was decided — ``"forced"`` (hold key) vs ``"detected"``
     (constrained auto-detect) — so the UI/QA can tell a missed key-press from a detection
-    miss. ``speaker`` is
+    miss. ``source`` records the **audio channel** the utterance came from (e.g. ``"Mic"`` /
+    ``"System"``) when several capture sources run in parallel — the technical origin, kept
+    separate from the semantic ``speaker``. ``speaker`` is
     unused in the MVP but kept on the schema so speaker attribution (PRD.md M2) can be
     added without a migration.
     """
@@ -31,7 +33,11 @@ class TranscriptEvent:
     ts_end: float
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     lang_source: Optional[str] = None  # "forced" (hold key) | "detected" (constrained auto-detect)
+    source: Optional[str] = None       # audio channel tag: "Mic" | "System" | … (None = single-source)
     speaker: Optional[str] = None
+    is_command: bool = False           # True = push-to-ask command, routed to the agent (not the transcript)
+    segment_id: Optional[str] = None   # stable per-utterance id; ties interim partials to their final commit
+    partial: bool = False              # True = tentative, in-progress decode for live display (never translated/stored)
     clean_text: Optional[str] = None
     translation: Optional[str] = None
     target_lang: Optional[str] = None

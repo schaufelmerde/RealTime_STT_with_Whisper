@@ -1,20 +1,20 @@
-"""OS-level push-to-force language control.
+"""OS-level push-to-ask control.
 
-Owns the active language pair and the "hold key" state. ``forced_lang()`` is the value
-the AudioCapture latches onto each segment at VAD onset (see PRD.md "Language selection"):
+Owns the "push-to-ask" hold key. ``command_active()`` is the value the AudioCapture latches
+onto each segment at VAD onset (see PRD.md "Language selection"):
 
-* hold key down → the **secondary** language (deterministic force, for when you code-switch)
-* hold key up   → ``None`` (Transcriber does constrained auto-detect over the pair — the
-  hands-free default that covers the other party, who never touches a key)
+* hold key down → ``True``: the utterance is a **command** for the AI assistant (it is
+  transcribed like everything else, then routed to the agent instead of the transcript).
+* hold key up   → ``False``: ordinary conversation that flows to the transcript/translator.
 
-The key is captured with an OS-level hotkey (``pynput``) because Streamlit can't see
-keyup. Listening is best-effort: if ``pynput`` is missing or its listener can't start
-(e.g. headless / no permission), ``forced_lang()`` simply always returns ``None`` and the
-pipeline still runs in auto-detect-only mode.
+The key is captured with an OS-level hotkey (``pynput``) because Streamlit can't see keyup.
+Listening is best-effort: if ``pynput`` is missing or its listener can't start (e.g.
+headless / no permission), ``command_active()`` always returns ``False`` and the app simply
+runs transcription-only with no push-to-ask.
 """
 
 import threading
-from typing import Optional, Tuple
+from typing import Optional
 
 # Friendly labels for the hold keys we let the UI choose from. Values are pynput
 # ``keyboard.Key`` attribute names, resolved lazily in start() so importing this module
@@ -25,26 +25,17 @@ HOLD_KEYS = {
     "alt_r": "Right Alt",
     "ctrl_l": "Left Ctrl",
 }
-DEFAULT_HOLD_KEY = "ctrl_r"
+DEFAULT_HOLD_KEY = "ctrl_l"
 
 
-class LanguageController:
-    def __init__(
-        self,
-        primary: str = "en",
-        secondary: str = "ko",
-        hold_key: str = DEFAULT_HOLD_KEY,
-    ):
-        self.primary = primary.lower()
-        self.secondary = secondary.lower()
+class CommandHotkey:
+    """Tracks the push-to-ask hold key via a global OS hotkey listener."""
+
+    def __init__(self, hold_key: str = DEFAULT_HOLD_KEY):
         self.hold_key = hold_key
         self._held = threading.Event()
         self._listener = None
         self._available = False
-
-    @property
-    def pair(self) -> Tuple[str, str]:
-        return (self.primary, self.secondary)
 
     @property
     def available(self) -> bool:
@@ -54,15 +45,15 @@ class LanguageController:
     def is_held(self) -> bool:
         return self._held.is_set()
 
-    def forced_lang(self) -> Optional[str]:
-        """Latched per-segment at onset: secondary while held, else None (auto-detect)."""
-        return self.secondary if self._held.is_set() else None
+    def command_active(self) -> bool:
+        """Latched per-segment at onset: True while the push-to-ask key is held."""
+        return self._held.is_set()
 
     def start(self):
         try:
             from pynput import keyboard
         except Exception:
-            return  # no pynput → auto-detect-only fallback
+            return  # no pynput → push-to-ask unavailable; transcription still runs
 
         target = getattr(keyboard.Key, self.hold_key, None)
         if target is None:

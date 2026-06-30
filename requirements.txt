@@ -1,11 +1,22 @@
 sounddevice==0.4.6
+soundcard>=0.4.3  # WASAPI loopback capture of system/program audio (optional — mic works without it)
+soxr>=0.3.0       # resample loopback (48kHz) down to the 16kHz ASR rate
 numpy>=1.26.0
 faster-whisper==1.0.2
 torch>=2.1.0
 torchaudio>=2.1.0
 silero-vad
-pynput>=1.7.6  # OS-level hold-to-force-language hotkey (Streamlit can't see keyup)
+pynput>=1.7.6  # OS-level push-to-ask hotkey (Streamlit can't see keyup)
 streamlit>=1.35.0
-# Cloud layer: transcript cleanup + KO<->EN translation (and the future agent layer)
-anthropic>=0.69.0
+# Phone-as-microphone bridge: a phone browser streams its mic over Wi-Fi to a small local
+# HTTPS+WSS server (utils/phone_server.py), feeding the WebMicReader. aiohttp serves the
+# capture page + WebSocket over TLS; segno renders the pairing QR; cryptography mints the
+# self-signed cert getUserMedia's secure-context rule requires. All optional — the rest of
+# the app runs without them (Phone source just reports them missing).
+aiohttp>=3.9.0
+segno>=1.6.0
+cryptography>=42.0.0
+# Cloud layer (free tier): KO<->EN translation + push-to-ask assistant (Google Search
+# grounding), both on the Gemini API.
+google-genai>=1.0.0
 python-dotenv>=1.0.0

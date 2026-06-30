@@ -1,5 +1,8 @@
 # 환경 변수 / 시크릿 (API 키 유출 방지)
 .env
+.env.local
+.env.*
+!.env.example
 
 # 가상환경 / 파이썬 캐시
 venv/
@@ -28,3 +31,12 @@ setup.py
 
 # 고화질 영상
 *.mp4
+
+# 사용자 고유명사 사전 (회사명/인명 등 개인정보 가능)
+vocabulary.json
+
+# 사용자 UI 설정 (선택한 마이크/앱 등 기기별 설정 — 세션 간 유지)
+user_settings.json
+
+# 저장된 회의 세션 (대화 내용/PII 포함 가능)
+sessions/

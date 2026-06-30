@@ -1,0 +1,12 @@
+# Studio Dark theme. Streamlit applies these tokens to its own widgets (sidebar, inputs,
+# tabs, buttons); main.py injects a matching stylesheet for the custom header, status pill,
+# config strip, cards, transcript bubbles, and assistant panel.
+[theme]
+base = "dark"
+primaryColor = "#2dd4bf"             # teal brand accent (buttons, focus rings, active widgets)
+backgroundColor = "#0b0e14"          # deep OLED-friendly app background
+secondaryBackgroundColor = "#121722" # sidebar + cards / raised surfaces
+textColor = "#e8eef6"
+borderColor = "#222b3a"              # default widget border, kept subtle for cohesion
+font = "sans serif"                  # main.py overrides to Inter via CSS (font-display: swap)
+baseRadius = "0.7rem"                # consistent corner rounding across widgets
